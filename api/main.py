@@ -13,6 +13,8 @@ import psycopg
 from psycopg.types.json import Jsonb
 from google import genai
 from google.genai import types
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 
 # Carrega variáveis do .env
 if os.path.exists("/opt/liric-api/.env"):
@@ -35,6 +37,7 @@ app.add_middleware(
 DB_URL = "postgresql://liric_admin:Liric%402026Db%21@127.0.0.1:5432/liric_db"
 JWT_SECRET = os.environ.get("JWT_SECRET", "liric-fallback-secret-key-2026")
 JWT_ALGORITHM = "HS256"
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 JWT_EXPIRA_HORAS = 24 * 7
 
 password_hash = PasswordHash.recommended()
@@ -52,6 +55,9 @@ class LoginRequest(BaseModel):
     email: str
     senha: str
 
+class GoogleLoginRequest(BaseModel):
+    credential: str
+
 class NovaRefeicao(BaseModel):
     calorias_totais: float
     proteinas_g: float = 0
@@ -62,7 +68,7 @@ class NovaRefeicao(BaseModel):
 def gerar_token_jwt(usuario_id: int, email: str) -> str:
     payload = {
         "sub": str(usuario_id),
-        "email": email,
+        "email": email.decode("utf-8") if isinstance(email, bytes) else str(email),
         "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRA_HORAS),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
@@ -180,6 +186,33 @@ def login_usuario(dados: LoginRequest):
         "access_token": token,
         "token_type": "bearer"
     }
+
+@app.post("/auth/google")
+def login_google(dados: GoogleLoginRequest):
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="GOOGLE_CLIENT_ID ausente no .env")
+    try:
+        info = id_token.verify_oauth2_token(dados.credential, google_requests.Request(), GOOGLE_CLIENT_ID)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Token Google invalido")
+    gsub, email = info["sub"], info["email"].strip().lower()
+    nome = info.get("name") or email.split("@")[0]
+    with psycopg.connect(DB_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, nome, email, google_id FROM usuarios WHERE google_id = %s OR email = %s;", (gsub, email))
+            u = cur.fetchone()
+            if u:
+                if not u[3]:
+                    cur.execute("UPDATE usuarios SET google_id = %s WHERE id = %s;", (gsub, u[0]))
+                    conn.commit()
+                uid, unome, uemail = u[0], u[1], u[2]
+            else:
+                sh = password_hash.hash(os.urandom(24).hex())
+                cur.execute("INSERT INTO usuarios (nome, email, senha_hash, google_id, meta_calorica_diaria, meta_calorica_semanal, status_assinatura, trial_expira_em) VALUES (%s, %s, %s, %s, 2000.0, 14000.0, 'trial', CURRENT_TIMESTAMP + INTERVAL '7 days') RETURNING id, nome, email;", (nome, email, sh, gsub))
+                n = cur.fetchone()
+                conn.commit()
+                uid, unome, uemail = n[0], n[1], n[2]
+    return {"id": uid, "nome": unome, "email": uemail, "access_token": gerar_token_jwt(uid, uemail), "token_type": "bearer"}
 
 @app.post("/refeicoes")
 def registrar_refeicao(dados: NovaRefeicao, user: dict = Depends(exigir_assinatura_ativa)):
@@ -309,7 +342,7 @@ def resumo_semanal(user: dict = Depends(obter_usuario_autenticado)):
 
 @app.get("/app", response_class=HTMLResponse)
 def interface_visual():
-    return """
+    html = """
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -317,6 +350,7 @@ def interface_visual():
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Liric AI — Contabilidade Calórica Semanal</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen font-sans p-4 md:p-8">
   <div class="max-w-xl mx-auto space-y-6">
@@ -350,9 +384,9 @@ def interface_visual():
         <label class="text-xs text-slate-400">Senha (mín. 6 caracteres)</label>
         <input id="auth-senha" type="password" placeholder="••••••" class="w-full mt-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm">
       </div>
-      <button id="btn-auth" onclick="enviarAuth()" class="w-full bg-emerald-500 hover:bg-emerald-600 text-slate-950 font-semibold py-2.5 rounded-xl transition">
-        Entrar na Conta
-      </button>
+<button id="btn-auth" onclick="enviarAuth()" class="w-full bg-emerald-500 hover:bg-emerald-600 text-slate-950 font-semibold py-2.5 rounded-xl transition">Entrar na Conta</button>
+      <div id="g_id_onload" data-client_id="__GID__" data-context="signin" data-ux_mode="redirect" data-login_uri="https://remained-various-doctor-estimate.trycloudflare.com/auth/google/redirect" data-callback="handleGoogleCredential" data-auto_prompt="false"></div>
+      <div class="flex justify-center pt-2"><div class="g_id_signin" data-type="standard" data-shape="rectangular" data-theme="filled_black" data-text="continue_with" data-size="large"></div></div>
       <p class="text-[11px] text-center text-slate-400">Experimente 7 dias grátis. Depois apenas R$ 16,90/ms.</p>
     </section>
 
@@ -421,6 +455,13 @@ def interface_visual():
       document.getElementById('btn-auth').innerText = modo === 'login' ? 'Entrar na Conta' : 'Criar Conta Grátis (7 Dias)';
     }
 
+async function handleGoogleCredential(r) {
+      const res = await fetch("/auth/google", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({credential: r.credential})});
+      const d = await res.json();
+      if (!res.ok) { alert(d.detail || "Erro Google"); return; }
+      localStorage.setItem("liric_token", d.access_token);
+      window.location.reload();
+    }
     async function enviarAuth() {
       const nome = document.getElementById('auth-nome').value;
       const email = document.getElementById('auth-email').value;
@@ -439,12 +480,12 @@ def interface_visual():
         return;
       }
       localStorage.setItem('liric_token', data.access_token);
-      verificarSessao();
+      window.location.reload();
     }
 
     function sair() {
       localStorage.removeItem('liric_token');
-      verificarSessao();
+      window.location.reload();
     }
 
     async function verificarSessao() {
@@ -531,3 +572,4 @@ def interface_visual():
 </body>
 </html>
 """
+    return html.replace("__GID__", GOOGLE_CLIENT_ID)
